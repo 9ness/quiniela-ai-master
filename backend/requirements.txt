@@ -3,3 +3,6 @@ google-generativeai
 pandas
 oauth2client
 python-dotenv
+requests
+beautifulsoup4
+lxml

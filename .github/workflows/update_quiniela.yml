@@ -32,4 +32,4 @@ jobs:
         GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       run: |
         cd backend
-        python main.py
+        python main.py --mode AUTO

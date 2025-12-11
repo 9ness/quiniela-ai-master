@@ -1,146 +1,278 @@
 import os
 import json
+import argparse
+import logging
 import gspread
 import pandas as pd
 import google.generativeai as genai
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
-import logging
+from scraper import get_next_week_matches, get_previous_results, normalize_name
+from dotenv import load_dotenv
+
+# Cargar variables de entorno locales (buscando en el mismo directorio del script)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 # Configuración de Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def get_credentials():
     """Obtiene credenciales de Google Sheets desde variable de entorno o archivo."""
+    # 1. Intentar archivo local primero (más robusto)
+    creds_path = os.path.join(BASE_DIR, "credentials.json")
+    if os.path.exists(creds_path):
+        logging.info(f"Usando credentials.json local: {creds_path}")
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        return ServiceAccountCredentials.from_json_keyfile_name(creds_path, scope)
+
+    # 2. Intentar Variable de Entorno
     creds_json = os.environ.get("G_SHEETS_CREDENTIALS")
     if creds_json:
         try:
             creds_dict = json.loads(creds_json)
+            if "private_key" in creds_dict:
+                creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
             scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
             return ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-        except json.JSONDecodeError as e:
-            logging.error(f"Error al decodificar credenciales JSON: {e}")
-            raise
-    elif os.path.exists("credentials.json"):
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        return ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
-    else:
-        raise FileNotFoundError("No se encontraron credenciales de Google Sheets (G_SHEETS_CREDENTIALS o credentials.json)")
+        except Exception as e:
+            logging.error(f"Error ENV: {e}")
+            pass
+            
+    raise FileNotFoundError("No se encontraron credenciales válidas ni en archivo ni en ENV.")
 
-def main():
+def setup_sheets(sh):
+    """Asegura que las hojas existan con las cabeceras correctas."""
+    # SEMANA ACTUAL
     try:
-        logging.info("Iniciando proceso de Quiniela AI...")
-        
-        # 1. Autenticación Google Sheets
-        creds = get_credentials()
-        client = gspread.authorize(creds)
-        
-        # Abrir Sheet por ID (Más seguro y robusto)
-        sheet_id = os.environ.get("GOOGLE_SHEET_ID")
-        if not sheet_id:
-            raise ValueError("Falta la variable de entorno GOOGLE_SHEET_ID")
+        ws_semana = sh.worksheet("Semana_Actual")
+    except gspread.WorksheetNotFound:
+        ws_semana = sh.add_worksheet(title="Semana_Actual", rows=20, cols=8)
+        ws_semana.append_row([
+            "Jornada", "Fecha", "Local", "Visitante", 
+            "Pronostico_Logico", "Justificacion_Logica", 
+            "Pronostico_Sorpresa", "Justificacion_Sorpresa"
+        ])
 
-        try:
-            sh = client.open_by_key(sheet_id)
-        except gspread.SpreadsheetNotFound:
-            logging.error(f"No se encontró el Google Sheet con ID: {sheet_id}")
-            return
+    # HISTORIAL
+    try:
+        ws_historial = sh.worksheet("Historial")
+    except gspread.WorksheetNotFound:
+        ws_historial = sh.add_worksheet(title="Historial", rows=100, cols=10) # +1 col Feedback
+        ws_historial.append_row([
+            "Jornada", "Partido", "Local", "Visitante",
+            "Pronostico_Logico", "Pronostico_Sorpresa", 
+            "Resultado_Real", "Acierto_Logico", "Acierto_Sorpresa", 
+            "Feedback_IA"
+        ])
+    
+    return ws_semana, ws_historial
 
-        # 2. Leer Historial (Últimas 5 jornadas)
-        worksheet_historial = sh.worksheet("Historial")
-        data = worksheet_historial.get_all_records()
-        df = pd.DataFrame(data)
+def run_friday_flow(sh, ws_semana, ws_historial, model):
+    """Flujo Estricto de Viernes (Rotación)"""
+    logging.info(">>> INICIANDO FLUJO DE VIERNES <<<")
+    
+    # --- PASO A: VALIDAR PASADO ---
+    current_data = ws_semana.get_all_records()
+    
+    if current_data:
+        logging.info(f"Paso A: Validando {len(current_data)} partidos de la semana anterior...")
+        real_results = get_previous_results()
         
-        # Asumimos que el historial tiene columnas como 'Jornada', 'Partido_1', 'Resultado_1', etc.
-        last_5_games = df.tail(5).to_dict(orient='records')
-        logging.info(f"Leídos {len(last_5_games)} registros históricos.")
-
-        # 3. Configurar Gemini
-        api_key = os.environ.get("GOOGLE_API_KEY")
-        if not api_key:
-            raise ValueError("Falta la variable de entorno GOOGLE_API_KEY")
+        # Mapa de resultados para búsqueda rápida
+        # Clave: LocalNormalizado-VisitanteNormalizado
+        results_map = {}
+        for r in real_results:
+            key = f"{normalize_name(r['local'])}-{normalize_name(r['visitante'])}"
+            results_map[key] = r['resultado_real']
+            
+        rows_to_history = []
         
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-pro')
-
-        # 4. Generar Prompt
-        context_str = json.dumps(last_5_games, indent=2, ensure_ascii=False)
-        
-        prompt = f"""
-        Actúa como un experto analista de fútbol español (La Quiniela).
-        
-        Aquí tienes los resultados de las últimas 5 jornadas para que entiendas las tendencias:
-        {context_str}
-        
-        Tu tarea es:
-        1. Analizar la jornada actual (que no te he pasado, asume que debes predecir una genérica o dame un formato estándar si no tienes los partidos específicos, pero idealmente el usuario debería proveer los partidos de la semana. ASUMIREMOS QUE LA TAREA ES GENERAR UNA PREDICCIÓN BASADA EN PATRONES GENERALES O DATOS SIMULADOS SI NO HAY INPUT DE PARTIDOS).
-        
-        NOTA CRÍTICA: Como este script es automático, vamos a asumir que necesitas generar una predicción para 15 partidos (formato estándar Quiniela).
-        
-        Genera una predicción para 15 partidos en formato JSON estricto:
-        [
-            {{"partido": 1, "local": "Equipo A", "visitante": "Equipo B", "pronostico": "1", "razonamiento": "..."}},
-            ...
-        ]
-        """
-        # Nota: En un caso real, deberíamos leer los partidos de la semana actual de otra hoja o API.
-        # Aquí simplificamos pidiendo a Gemini que razone o "simule" si no hay datos de entrada de los partidos.
-        # MEJORA: Leer partidos de la hoja 'Proxima_Jornada' si existe. 
-        # Vamos a intentar leer de 'Proxima_Jornada' si existe, si no, prompt genérico.
-        
-        try:
-            worksheet_proxima = sh.worksheet("Proxima_Jornada")
-            proxima_jornada_data = worksheet_proxima.get_all_records()
-            matches_str = json.dumps(proxima_jornada_data, ensure_ascii=False)
-            prompt += f"\n\nPartidos de esta semana:\n{matches_str}\n\nGenera los pronósticos para estos partidos."
-        except gspread.WorksheetNotFound:
-            logging.warning("No se encontró hoja 'Proxima_Jornada'. Gemini intentará deducir o simular.")
-
-        logging.info("Consultando a Gemini...")
-        response = model.generate_content(prompt)
-        text_response = response.text
-        
-        # Limpieza básica de markdown JSON
-        if "```json" in text_response:
-            text_response = text_response.replace("```json", "").replace("```", "")
-        
-        try:
-            predictions = json.loads(text_response)
-        except json.JSONDecodeError:
-            logging.error("Gemini no devolvió un JSON válido. Respuesta raw:")
-            logging.error(text_response)
-            return
-
-        # 5. Escribir en 'Semana_Actual'
-        try:
-            worksheet_semana = sh.worksheet("Semana_Actual")
-            worksheet_semana.clear()
-        except gspread.WorksheetNotFound:
-            worksheet_semana = sh.add_worksheet(title="Semana_Actual", rows=20, cols=5)
-        
-        # Headers
-        headers = ["Partido", "Local", "Visitante", "Pronostico", "Razonamiento"]
-        worksheet_semana.append_row(headers)
-        
-        rows_to_write = []
-        for pred in predictions:
-            rows_to_write.append([
-                pred.get("partido"),
-                pred.get("local", "N/A"),
-                pred.get("visitante", "N/A"),
-                pred.get("pronostico"),
-                pred.get("razonamiento")
+        for i, row in enumerate(current_data):
+            # Construir clave
+            key = f"{normalize_name(row['Local'])}-{normalize_name(row['Visitante'])}"
+            real_res = results_map.get(key, "?") # ? si no se encuentra (partido aplazado o error scraping)
+            
+            p_log = str(row['Pronostico_Logico']).upper().strip()
+            p_sor = str(row['Pronostico_Sorpresa']).upper().strip()
+            
+            is_hit_log = (p_log == real_res) if real_res != "?" else False
+            is_hit_sor = (p_sor == real_res) if real_res != "?" else False
+            
+            feedback = "Pendiente"
+            if real_res != "?":
+                feedback = "Acierto Lógico" if is_hit_log else ("Acierto Sorpresa" if is_hit_sor else "Fallo")
+            
+            rows_to_history.append([
+                row['Jornada'],
+                row.get('Partido', i+1),
+                row['Local'],
+                row['Visitante'],
+                p_log,
+                p_sor,
+                real_res,
+                "TRUE" if is_hit_log else "FALSE",
+                "TRUE" if is_hit_sor else "FALSE",
+                feedback
             ])
             
-        worksheet_semana.append_rows(rows_to_write)
+        # Mover a Historial
+        if rows_to_history:
+            ws_historial.append_rows(rows_to_history)
+            logging.info(f"Guardadas {len(rows_to_history)} filas en Historial.")
+            
+        # Limpiar
+        logging.info("Limpiando hoja Semana_Actual...")
+        ws_semana.clear()
+        ws_semana.append_row([
+            "Jornada", "Fecha", "Local", "Visitante", 
+            "Pronostico_Logico", "Justificacion_Logica", 
+            "Pronostico_Sorpresa", "Justificacion_Sorpresa"
+        ])
+    else:
+        logging.info("Paso A: Semana_Actual vacía, nada que validar.")
+
+    # --- PASO B: PREDECIR FUTURO ---
+    logging.info("Paso B: Obteniendo partidos de la próxima jornada...")
+    next_matches = get_next_week_matches()
+    
+    if next_matches is None:
+        logging.error("ABORTANDO: Se detectaron equipos no válidos (Champions/Selecciones).")
+        return # Abortar
         
-        # Actualizar fecha de actualización
-        worksheet_semana.update_acell("G1", f"Actualizado: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    if not next_matches:
+        logging.warning("No se encontraron partidos próximos.")
+        return
+
+    # CONTROL DE DUPLICADOS
+    # Verificar si ya están escritos. Leemos de nuevo por si acaso (aunque acabamos de limpiar)
+    # Si acabamos de limpiar, estará vacía. Pero si saltamos Paso A (estaba vacía), ok.
+    # SI el usuario ejecuta esto manualmente 2 veces rapidas, la 2a vez la hoja tendra datos.
+    # Check simple: ¿La hoja tiene > 1 fila? Si es así, validamos si es la misma jornada.
+    
+    existing_data = ws_semana.get_all_records()
+    if existing_data:
+        # Comprobar primer partido
+        first_existing = existing_data[0]
+        first_new = next_matches[0]
         
-        logging.info("Predicciones guardadas exitosamente en 'Semana_Actual'.")
+        # Comparación laxa
+        if (normalize_name(first_existing['Local']) == normalize_name(first_new['local']) and 
+            normalize_name(first_existing['Visitante']) == normalize_name(first_new['visitante'])):
+            logging.warning("DUPLICADOS: Los partidos de esta jornada ya existen en Semana_Actual. Abortando para no sobrescribir.")
+            return
+
+    # GENERAR PREDICCIONES CON GEMINI
+    logging.info("Consultando a Gemini 1.5 Flash...")
+    
+    prompt = f"""
+    Eres un experto en probabilidad deportiva. Para los siguientes partidos de La Liga, dame dos predicciones:
+    Lógica: El resultado más probable matemáticamente.
+    Sorpresa: Un resultado plausible que pagaría bien pero tiene riesgo. 
+    Devuelve un JSON estricto.
+
+    PARTIDOS:
+    {json.dumps(next_matches, indent=2)}
+
+    FORMATO DE RESPUESTA JSON (Lista de objetos):
+    [
+      {{
+        "partido": 1,
+        "pronostico_logico": "1",
+        "justificacion_logica": "Breve razón...",
+        "pronostico_sorpresa": "X",
+        "justificacion_sorpresa": "Breve razón..."
+      }},
+      ...
+    ]
+    """
+    
+    try:
+        response = model.generate_content(prompt)
+        text = response.text
+        if "```json" in text:
+            text = text.replace("```json", "").replace("```", "")
+        predictions = json.loads(text)
+    except Exception as e:
+        logging.error(f"Error Gemini: {e}")
+        return
+
+    # --- PASO C: ESCRITURA ---
+    logging.info("Paso C: Escribiendo nuevas predicciones...")
+    
+    # Calcular jornada
+    hist_data = ws_historial.get_all_records()
+    last_jornada = 0
+    if hist_data:
+        try:
+            last_jornada = int(hist_data[-1]["Jornada"])
+        except: pass
+    new_jornada = last_jornada + 1
+    today = datetime.now().strftime("%Y-%m-%d")
+    
+    final_rows = []
+    # Mapear
+    pred_map = {p.get("partido"): p for p in predictions} # Por indice partido 1..15
+    # OJO: Gemini puede no devolver "partido" ID exacto si no se lo decimos bien, 
+    # pero le pasamos los datos con ID. Asumimos que respeta.
+    
+    # Fallback: asumimos mismo orden si el ID falla
+    use_index = False
+    if not pred_map: use_index = True 
+    
+    for i, match in enumerate(next_matches):
+        p = pred_map.get(match["partido"]) 
+        if not p and use_index and i < len(predictions):
+             p = predictions[i]
+        if not p: p = {}
+             
+        final_rows.append([
+            new_jornada,
+            today,
+            match["local"],
+            match["visitante"],
+            p.get("pronostico_logico", "?"),
+            p.get("justificacion_logica", ""),
+            p.get("pronostico_sorpresa", "?"),
+            p.get("justificacion_sorpresa", "")
+        ])
+
+    ws_semana.append_rows(final_rows)
+    logging.info("¡Proceso Completado con Éxito!")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["AUTO", "MANUAL_PREDICT"], required=True)
+    args = parser.parse_args()
+
+    try:
+        creds = get_credentials()
+        client = gspread.authorize(creds)
+        sheet_id = os.environ.get("GOOGLE_SHEET_ID")
+        if not sheet_id: raise ValueError("GOOGLE_SHEET_ID missing")
+        sh = client.open_by_key(sheet_id)
+        ws_semana, ws_historial = setup_sheets(sh)
+        
+        api_key = os.environ.get("GOOGLE_API_KEY")
+        if not api_key: raise ValueError("GOOGLE_API_KEY missing")
+        genai.configure(api_key=api_key)
+        
+        # GEMINI 2.5 PRO CONFIG (El más potente disponible según lista usuario)
+        model = genai.GenerativeModel('gemini-2.5-pro', generation_config={"response_mime_type": "application/json"})
+
+        if args.mode == "MANUAL_PREDICT":
+            # Para manual, usamos el mismo flujo de Viernes para asegurar consistencia
+            # OJO: El usuario pidió "no queremos que al desplegar haga llamada manual... necesitamos opcion de ejecutar manual cuando yo quiera"
+            # Si quiere FORZAR, quizás quiera saltarse el check de duplicados?
+            # "No sobrescribas ni borres nada... para evitar reseteos accidentales si ejecuto el script manualmente"
+            # Así que el flujo seguro es el mismo.
+            run_friday_flow(sh, ws_semana, ws_historial, model)
+            
+        elif args.mode == "AUTO":
+             run_friday_flow(sh, ws_semana, ws_historial, model)
 
     except Exception as e:
-        logging.error(f"Error crítico en el proceso: {e}")
+        logging.critical(f"Error Fatal: {e}")
         raise
 
 if __name__ == "__main__":

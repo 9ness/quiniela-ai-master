@@ -1,11 +1,14 @@
 import { google } from 'googleapis';
 
 export type QuinielaRow = {
-    partido: string;
+    jornada: string;
+    fecha: string;
     local: string;
     visitante: string;
-    pronostico: string;
-    razonamiento: string;
+    pronostico_logico: string;
+    justificacion_logica: string;
+    pronostico_sorpresa: string;
+    justificacion_sorpresa: string;
 };
 
 export type StatsRow = {
@@ -34,19 +37,22 @@ export async function getQuinielaData() {
             throw new Error("NEXT_PUBLIC_SHEET_ID no definido");
         }
 
-        // Leer predicciones de la semana actual
+        // Leer predicciones de la semana actual (Rango ampliado A:H)
         const responseSemana = await sheets.spreadsheets.values.get({
             spreadsheetId,
-            range: 'Semana_Actual!A2:E20', // Asumiendo rango
+            range: 'Semana_Actual!A2:H20',
         });
 
         const rowsSemana = responseSemana.data.values || [];
         const predicciones: QuinielaRow[] = rowsSemana.map((row: any) => ({
-            partido: row[0],
-            local: row[1],
-            visitante: row[2],
-            pronostico: row[3],
-            razonamiento: row[4],
+            jornada: row[0],
+            fecha: row[1],
+            local: row[2],
+            visitante: row[3],
+            pronostico_logico: row[4],
+            justificacion_logica: row[5],
+            pronostico_sorpresa: row[6],
+            justificacion_sorpresa: row[7],
         }));
 
         // Leer estadísticas si es necesario
