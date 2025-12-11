@@ -1,0 +1,20 @@
+﻿Checking https://www.resultados-futbol.com/quiniela/historico/26...
+ACCEPTED: Villarreal vs Getafe
+ACCEPTED: Deportivo Alav. vs Real Sociedad
+ACCEPTED: Real Betis vs FC Barcelona
+ACCEPTED: Elche vs Girona FC
+ACCEPTED: Valencia vs Sevilla
+ACCEPTED: Espanyol vs Rayo Vallecano
+ACCEPTED: Real Madrid vs Celta
+ACCEPTED: Osasuna vs Levante
+ACCEPTED: FC Andorra vs AlmerÝa
+ACCEPTED: Huesca vs Real Valladolid
+ACCEPTED: Cßdiz vs Racing
+ACCEPTED: LeganÚs vs C¾rdoba CF
+ACCEPTED: RC Deportivo vs CD Castell¾n
+REJECTED: Granada (granada) vs AD Ceuta FC (ad ceuta fc) -> L_OK=True V_OK=False
+ACCEPTED: Athletic vs AtlÚtico de Ma.
+ACCEPTED: Deportivo Al. vs Real Sociedad
+ACCEPTED: Espanyol vs Rayo Valleca.
+REJECTED: Huesca (huesca) vs Real Vallado. (real vallado.) -> L_OK=True V_OK=False
+ACCEPTED: Athletic vs AtlÚtico de .
