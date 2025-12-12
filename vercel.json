@@ -13,7 +13,7 @@
     "routes": [
         {
             "src": "/api/execute",
-            "dest": "backend/main.py"
+            "dest": "/backend/main.py"
         },
         {
             "src": "/(.*)",
