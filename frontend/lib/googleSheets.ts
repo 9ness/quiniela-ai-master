@@ -23,8 +23,13 @@ export async function getQuinielaData() {
         // Autenticación: En Vercel, configurar las vars de entorno
         // Se puede usar una Service Account o API Key si es público.
         // Aquí usamos Service Account estándar para lectura robusta.
+        const creds = JSON.parse(process.env.G_SHEETS_CREDENTIALS || '{}');
+        if (creds.private_key) {
+            creds.private_key = creds.private_key.replace(/\\n/g, '\n');
+        }
+
         const auth = new google.auth.GoogleAuth({
-            credentials: JSON.parse(process.env.G_SHEETS_CREDENTIALS || '{}'),
+            credentials: creds,
             scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
         });
 
