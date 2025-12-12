@@ -20,12 +20,25 @@ export type StatsRow = {
 
 export async function getQuinielaData() {
     try {
-        // Autenticación: En Vercel, configurar las vars de entorno
-        // Se puede usar una Service Account o API Key si es público.
-        // Aquí usamos Service Account estándar para lectura robusta.
-        const creds = JSON.parse(process.env.G_SHEETS_CREDENTIALS || '{}');
+        // Autenticación:
+        let credsStr = process.env.G_SHEETS_CREDENTIALS || '{}';
+
+        // Limpieza robusta de comillas envolventes (común en Vercel/Env locals)
+        if (credsStr.startsWith("'") && credsStr.endsWith("'")) {
+            credsStr = credsStr.slice(1, -1);
+        }
+        if (credsStr.startsWith('"') && credsStr.endsWith('"')) {
+            credsStr = credsStr.slice(1, -1);
+        }
+
+        const creds = JSON.parse(credsStr);
+
         if (creds.private_key) {
-            creds.private_key = creds.private_key.replace(/\\n/g, '\n');
+            // Reemplazo de saltos de línea escapados.
+            // Manejamos tanto \\n (literal) como \n (real) por si acaso.
+            creds.private_key = creds.private_key
+                .replace(/\\n/g, '\n')
+                .replace(/\\\\n/g, '\n'); // Doble escape por si acaso
         }
 
         const auth = new google.auth.GoogleAuth({
